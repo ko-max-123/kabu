@@ -13,17 +13,27 @@ import webbrowser
 import textwrap
 import re
 
-# 追加：Selenium関連
+# ----- Selenium関連 -----
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.chrome.options import Options  # ここがポイント
+from selenium.webdriver.chrome.options import Options
 
 # ===== 設定項目 =====
-CHECK_URL = "https://kabutan.jp/news/marketnews/?category=3"  # チェック対象のURL
-LAST_RECORD_FILE = "last_article.txt"       # 前回取得した最新記事タイトルを記録するファイル
-EXCEL_FILE = "articles.xlsx"                # 記録用Excelファイル
+CHECK_URLS = [
+    "https://kabutan.jp/news/marketnews/?category=3",
+    "https://kabutan.jp/news/marketnews/?category=10",
+    "https://kabutan.jp/news/marketnews/?category=2",
+    "https://kabutan.jp/news/marketnews/?category=8",
+    "https://kabutan.jp/news/marketnews/?category=9"
+]
+# URLに応じて前回記録用のファイルを振り分け
+url_to_lastfile = {}
+for url in CHECK_URLS:
+    cat = url.split("category=")[-1]
+    url_to_lastfile[url] = f"last_article_{cat}.txt"
 
+EXCEL_FILE = "articles.xlsx"                # 記録用Excelファイル
 RESULT_FONT = ("TkDefaultFont", 13)         # 検索結果表示用フォント
 BODY_FONT = ("TkDefaultFont", 13)           # 別ウィンドウ本文表示用フォント
 
@@ -33,12 +43,19 @@ worker_thread = None
 
 # 銘柄コード抽出用の正規表現：<1234> のような4桁数字を取り出す
 CODE_PATTERN = re.compile(r"<(\d{4})>")
+# 「赤字」「黒字」を色分けするための正規表現
+COLOR_PATTERN = re.compile("(赤字|黒字)")
 
 def get_latest_news(url):
+    """
+    指定URLから最初のニュース(最上部tr)の情報を取得
+    (ニュース時刻, カテゴリ, タイトル, フルURL) を返す
+    """
     response = requests.get(url)
     response.raise_for_status()
     soup = BeautifulSoup(response.text, 'html.parser')
     
+    # 修正箇所： tbody → 削除
     tr = soup.select_one("table.s_news_list tr")
     if not tr:
         del soup, response
@@ -63,8 +80,7 @@ def get_latest_news(url):
 def read_last_record(file_path):
     if os.path.exists(file_path):
         with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read().strip()
-        return content
+            return f.read().strip()
     return None
 
 def write_last_record(file_path, record):
@@ -103,18 +119,15 @@ def open_sbi_with_code(code_list):
     """
     SBI証券サイトを開き、account.txtに記載のID/PWでログインし、
     その後、株価検索フォームに銘柄コードを入力して検索する。
-    【修正】ブラウザは閉じず、Seleniumの制御も解除してユーザーが使えるようにする
+    ブラウザを閉じず、Seleniumの制御も解除
     """
     if not code_list:
         print("銘柄コードがありません。操作を中断します。")
         return
 
-    code = code_list[0]  # 例として先頭の銘柄コードだけを検索
-
-    # SBI証券のトップページ
+    code = code_list[0]  # 例として先頭の銘柄コードを検索
     sbi_url = "https://site2.sbisec.co.jp/ETGate/"
 
-    # account.txtからIDとPWを読み込み
     if not os.path.exists("account.txt"):
         print("account.txt が存在しません。ID/PWを設定してください。")
         return
@@ -126,62 +139,49 @@ def open_sbi_with_code(code_list):
     user_id = lines[0].strip()
     user_pw = lines[1].strip()
 
-    # === Chromeのフラグ・オプションを指定 ===
     chrome_options = Options()
-
-    # ★ここがポイント：この設定を入れると、Pythonスクリプトが終了してもChromeが閉じず、
-    #                    ユーザーがそのまま操作できます
+    # detachにより、スクリプト終了後もブラウザを閉じない
     chrome_options.add_experimental_option("detach", True)
-
-    # 例: GPUアクセラレーション無効化、ソフトウェアラスタライザ無効化等
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--disable-software-rasterizer")
-    chrome_options.add_argument("--start-maximized")  # 起動時にウィンドウ最大化
+    chrome_options.add_argument("--start-maximized")
 
-    # ChromeDriverを起動 (ChromeDriverのパスが必要ならexecutable_path=...で指定)
     driver = webdriver.Chrome(options=chrome_options)
-
     try:
-        # 1) SBI証券サイトを開く
         driver.get(sbi_url)
         time.sleep(2)
 
-        # 2) ログインフォームを操作 (実際のHTML構造に合わせて修正)
+        # ログインフォーム要素名を適宜修正
+        user_box = driver.find_element(By.NAME, "user_id")
+        pass_box = driver.find_element(By.NAME, "user_password")
+        user_box.send_keys(user_id)
+        pass_box.send_keys(user_pw)
+        login_btn = driver.find_element(By.NAME, "ACT_login")
+        login_btn.click()
+
+        time.sleep(3)  # ログイン処理待ち
+
         try:
-            user_box = driver.find_element(By.NAME, "user_id")
-            pass_box = driver.find_element(By.NAME, "user_password")
-            user_box.send_keys(user_id)
-            pass_box.send_keys(user_pw)
-
-            login_btn = driver.find_element(By.NAME, "ACT_login")
-            login_btn.click()
-        except Exception as e:
-            print("ログイン要素が見つからない、または操作に失敗:", e)
-            return
-
-        time.sleep(3)  # ログイン待機
-
-        # 3) ヘッダーの株価検索フォームにコードを入力 & 検索
-        try:
-            stock_search_box = driver.find_element(By.NAME, "i_stock_sec")  # サイト構造に合わせて修正
+            # 修正箇所: stock_search_box の要素名
+            stock_search_box = driver.find_element(By.NAME, "i_stock_sec")
             stock_search_box.send_keys(code)
-            driver.find_element(By.CSS_SELECTOR, "#srchK > a").click()  # これも実際のIDに合わせて修正
+            # 修正箇所: 検索ボタン -> CSS_SELECTOR "#srchK > a"
+            driver.find_element(By.CSS_SELECTOR, "#srchK > a").click()
         except Exception as e:
             print("株価検索フォームが見つからない、または操作失敗:", e)
             return
 
         print(f"銘柄コード {code} を検索しました。")
-
-        # ★Selenium制御を終了してもブラウザを開いたままにするために、
-        # ここでは driver.quit() や driver.close() を呼び出さない
-        # これでユーザーが残ったブラウザを自由に操作できます
-
     except Exception as e:
         print("SBI証券での操作中にエラーが発生:", e)
-    # ここでdriver.quit()を呼ばない
-
 
 def show_body_window(url):
+    """
+    記事本文を別ウィンドウで表示
+    (銘柄コード抽出/「証券会社のページを開く」ボタン等)
+    - brタグを改行に置き換え
+    - 「。」で改行
+    """
     try:
         resp = requests.get(url)
         resp.raise_for_status()
@@ -189,15 +189,19 @@ def show_body_window(url):
         
         body_elem = soup.select_one(".body")
         if body_elem:
-            body_text = body_elem.get_text(strip=True)
+            # brタグを改行に置き換え
+            for br in body_elem.find_all("br"):
+                br.replace_with("\n")
+
+            body_text = body_elem.get_text()
+            # 「。」があるときは改行を挿入
+            body_text = body_text.replace("。", "。\n")
         else:
             body_text = "本文を取得できませんでした。"
-
         del soup, resp
     except Exception as e:
         body_text = f"エラーが発生しました: {e}"
 
-    # 別ウィンドウ
     win = tk.Toplevel(root)
     win.title("記事本文")
 
@@ -214,17 +218,17 @@ def show_body_window(url):
     body_frame = ttk.Frame(canvas)
     canvas.create_window((0,0), window=body_frame, anchor='nw')
 
-    wrapped_lines = textwrap.wrap(body_text, width=80)
-    for line in wrapped_lines:
+    # body_text を行ごとに分割して表示 (改行が増えたぶん分割しやすい)
+    lines = body_text.split("\n")
+    for line in lines:
         line_label = tk.Label(body_frame, text=line, font=BODY_FONT, justify="left")
-        line_label.pack(anchor='w', pady=5, padx=5)
+        line_label.pack(anchor='w', pady=2, padx=5)
 
     def on_configure(event):
         canvas.config(scrollregion=canvas.bbox("all"))
-
     body_frame.bind("<Configure>", on_configure)
 
-    # ＜XXXX＞という形式の銘柄コードを抜き出す
+    # 銘柄コード
     codes = CODE_PATTERN.findall(body_text)
     if codes:
         codes_label = tk.Label(content_frame, text=f"取得した銘柄コード: {', '.join(codes)}", fg="green", font=BODY_FONT)
@@ -235,13 +239,11 @@ def show_body_window(url):
 
     def open_original():
         webbrowser.open(url)
-
     open_button = tk.Button(content_frame, text="元ページを開く", command=open_original, bg="blue", fg="white", font=BODY_FONT)
     open_button.grid(row=2, column=0, pady=10, sticky=tk.W)
 
     def open_sbi():
         open_sbi_with_code(codes)
-
     sbi_button = tk.Button(content_frame, text="証券会社のページを開く", command=open_sbi, bg="green", fg="white", font=BODY_FONT)
     sbi_button.grid(row=2, column=1, pady=10, padx=10, sticky=tk.W)
 
@@ -251,11 +253,11 @@ def show_body_window(url):
     content_frame.rowconfigure(0, weight=1)
 
 def format_result_text(parent, text):
-    # 「赤字」を赤、「黒字」を青で表示
-    pattern = re.compile("(赤字|黒字)")
+    """
+    検索結果の1行テキストから「赤字」を赤、「黒字」を青で表示
+    """
     pos = 0
-    matches = list(pattern.finditer(text))
-
+    matches = list(COLOR_PATTERN.finditer(text))
     for m in matches:
         keyword = m.group(0)
         color = "red" if keyword == "赤字" else "blue"
@@ -273,6 +275,10 @@ def format_result_text(parent, text):
         lbl.pack(side='left', padx=0)
 
 def print_result(msg, url=None):
+    """
+    結果表示用エリアに1行追加。
+    URLがあれば「記事を見る」ボタンを付加。
+    """
     def insert_line():
         line_frame = ttk.Frame(results_frame)
         line_frame.pack(fill='x', pady=2, anchor='w')
@@ -290,30 +296,42 @@ def print_result(msg, url=None):
 
     results_frame.after(0, insert_line)
 
-def check_for_update():
-    latest_news = get_latest_news(CHECK_URL)
+def check_for_update_on_url(url):
+    """
+    1つのURLに対してニュース更新チェックを行う。
+    """
+    latest_news = get_latest_news(url)
     if not latest_news:
-        print_result(f"{datetime.now()}: 記事を取得できませんでした。")
+        print_result(f"{datetime.now()}: {url} 記事を取得できませんでした。")
         return
     
     news_time, category, latest_title, full_url = latest_news
-    last_record = read_last_record(LAST_RECORD_FILE)
+
+    last_file = url_to_lastfile[url]
+    last_record = read_last_record(last_file)
     
     if latest_title != last_record:
-        append_to_excel(EXCEL_FILE, latest_news)
+        append_to_excel(EXCEL_FILE, (news_time, category, latest_title, full_url))
         show_notification("新着記事", f"新しい記事が更新されました: {latest_title}")
-        print_result(f"{datetime.now()}: 新着記事を記録しました - {latest_title}", url=full_url)
-        write_last_record(LAST_RECORD_FILE, latest_title)
-    else:
-        print_result(f"{datetime.now()}: 更新がありません")
+        print_result(f"{news_time}: [{category}] {latest_title}", url=full_url)
+        write_last_record(last_file, latest_title)
+    #else:
+    #    print_result(f"{datetime.now()}: [{url}] 更新がありません")
 
     del latest_news, last_record, latest_title, full_url
     gc.collect()
 
+def check_for_update_all_urls():
+    """
+    CHECK_URLSに含まれる複数URLを一括チェック
+    """
+    for url in CHECK_URLS:
+        check_for_update_on_url(url)
+
 def scraping_worker():
     global stop_flag, interval_minutes
     while not stop_flag:
-        check_for_update()
+        check_for_update_all_urls()
         for _ in range(interval_minutes * 60):
             if stop_flag:
                 break
@@ -322,7 +340,6 @@ def scraping_worker():
 
 def start_scraping():
     global stop_flag, worker_thread, interval_minutes
-
     try:
         val = interval_entry.get().strip()
         if val:
@@ -343,9 +360,9 @@ def stop_scraping():
     stop_flag = True
     print_result("停止ボタンが押されました。")
 
-# GUI構築
+# ==================== GUI構築 ====================
 root = tk.Tk()
-root.title("ニューススクレイパー")
+root.title("ニューススクレイパー (複数ページ対応)")
 
 frame = ttk.Frame(root, padding=20)
 frame.grid(sticky=(tk.W, tk.E, tk.N, tk.S))
